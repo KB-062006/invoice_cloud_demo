@@ -1,6 +1,6 @@
 import json
 import os
-import urllib.parse
+from urllib.parse import unquote_plus
 import boto3
 
 s3 = boto3.client("s3")
@@ -13,21 +13,37 @@ def lambda_handler(event, context):
 
     for record in event["Records"]:
         bucket = record["s3"]["bucket"]["name"]
-        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+        key = unquote_plus(record["s3"]["object"]["key"])
         print(f"New invoice detected: s3://{bucket}/{key}")
 
+        # 1. Read the raw invoice JSON from S3
         invoice = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
 
-        subtotal = float(invoice["subtotal"])
-        gst = round(subtotal * 0.18, 2)
-        grand_total = round(subtotal + gst, 2)
+        # 2. Extract fields safely regardless of key naming
+        invoice_id = invoice.get("invoice_id") or invoice.get("id") or key.split("/")[-1].replace(".json", "")
+        customer = invoice.get("customer") or invoice.get("customer_name") or "Unknown"
+        item = invoice.get("item") or "Item"
+        quantity = int(invoice.get("quantity", 1))
         created_at = invoice.get("created_at", "N/A")
 
+        if "subtotal" in invoice:
+            subtotal = float(invoice["subtotal"])
+        elif "unit_price" in invoice:
+            subtotal = round(quantity * float(invoice["unit_price"]), 2)
+        elif "price" in invoice:
+            subtotal = round(quantity * float(invoice["price"]), 2)
+        else:
+            subtotal = float(invoice.get("amount", 0))
+
+        gst = round(subtotal * 0.18, 2)
+        grand_total = round(subtotal + gst, 2)
+
         summary = {
-            "invoice_id": invoice["invoice_id"],
+            "invoice_id": invoice_id,
             "student_roll": student_roll,
-            "customer_name": invoice["customer_name"],
-            "item": invoice["item"],
+            "customer": customer,
+            "item": item,
+            "quantity": quantity,
             "subtotal": subtotal,
             "gst_18_percent": gst,
             "grand_total": grand_total,
@@ -35,7 +51,8 @@ def lambda_handler(event, context):
             "status": "PROCESSED",
         }
 
-        summary_key = f"processed/{invoice['invoice_id']}_summary.json"
+        # 3. Write summary JSON under processed/
+        summary_key = f"processed/{invoice_id}_summary.json"
         s3.put_object(
             Bucket=bucket,
             Key=summary_key,
@@ -44,11 +61,12 @@ def lambda_handler(event, context):
         )
         print(f"Summary written: s3://{bucket}/{summary_key}")
 
-        subject = f"[{student_roll}] New invoice {invoice['invoice_id']} for {invoice['customer_name']}"
+        # 4. Publish email alert via SNS
+        subject = f"[{student_roll}] New invoice {invoice_id} for {customer}"
         body = (
-            f"Invoice ID : {invoice['invoice_id']}\n"
-            f"Customer   : {invoice['customer_name']}\n"
-            f"Item       : {invoice['item']} (qty {invoice['quantity']})\n"
+            f"Invoice ID : {invoice_id}\n"
+            f"Customer   : {customer}\n"
+            f"Item       : {item} (qty {quantity})\n"
             f"Subtotal   : Rs {subtotal}\n"
             f"GST (18%)  : Rs {gst}\n"
             f"Grand Total: Rs {grand_total}\n"
